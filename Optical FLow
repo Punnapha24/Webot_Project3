@@ -1,0 +1,311 @@
+from controller import Robot, Display
+import numpy as np
+import math
+
+# ─────────────────────────────────────────────
+#  IMAGE / PERCEPTION HELPERS
+# ─────────────────────────────────────────────
+
+def downScale(height, width, img_array):
+    small = img_array[::int(img_array.shape[0] // height), ::int(img_array.shape[1] // width)]
+    return small
+
+def grayscale(array):
+    weights = np.array([0.299, 0.587, 0.114])
+    return np.dot(array[..., :3], weights)
+
+def convolution(array, kernel):
+    kernel = np.array(kernel, dtype=float)
+    if kernel.sum() != 0:
+        kernel /= kernel.sum()
+    window = kernel.shape[0]
+    pad = window // 2
+    padded = np.pad(array, ((pad, pad), (pad, pad)), mode='constant')
+    convo_im = np.zeros_like(array, dtype=float)
+    row, col = array.shape
+    for i in range(row):
+        for j in range(col):
+            region = padded[i:i+window, j:j+window]
+            convo_im[i, j] = np.sum(region * kernel)
+    return convo_im
+
+def gaussianBlur(array):
+    blur_kernel = [
+        [1,  4,  6,  4,  1],
+        [4, 16, 24, 16,  4],
+        [6, 24, 36, 24,  6],
+        [4, 16, 24, 16,  4],
+        [1,  4,  6,  4,  1]
+    ]
+    return convolution(array, blur_kernel)
+
+def growBlob(x, y, edge_map, visited):
+    h, w = edge_map.shape
+    stack = [(x, y)]
+    pixels = []
+    while stack:
+        cx, cy = stack.pop()
+        if cx < 0 or cx >= w or cy < 0 or cy >= h:
+            continue
+        if visited[cy, cx]:
+            continue
+        if edge_map[cy, cx] != 0:
+            continue
+        visited[cy, cx] = True
+        pixels.append((cx, cy))
+        stack.extend([(cx-1, cy), (cx+1, cy), (cx, cy-1), (cx, cy+1)])
+    return pixels
+
+def blobDetect(edge_map):
+    h, w = edge_map.shape
+    visited = np.zeros((h, w), dtype=bool)
+    blobs = []
+    for y in range(h):
+        for x in range(w):
+            if edge_map[y, x] == 0 and not visited[y, x]:
+                pixels = growBlob(x, y, edge_map, visited)
+                if pixels:
+                    blobs.append({"pixels": pixels})
+    return blobs
+
+def get_histogram(frame, blob):
+    histogram = np.zeros((8, 8, 8), dtype=float)
+    for (x, y) in blob["pixels"]:
+        r, g, b = frame[y, x]
+        histogram[r//32, g//32, b//32] += 1
+    return histogram / (histogram.sum() + 1e-10)
+
+def get_gradients(array):
+    vertical_kernel   = [[1, 0, -1], [2, 0, -2], [1, 0, -1]]
+    horizontal_kernel = [[1, 2, 1], [0, 0, 0], [-1, -2, -1]]
+    gx = convolution(array, horizontal_kernel)
+    gy = convolution(array, vertical_kernel)
+    return gx, gy
+
+def get_gradient_histogram(gx, gy, blob):
+    hist = np.zeros(8, dtype=float)
+    for (x, y) in blob["pixels"]:
+        val_x = gx[y, x]
+        val_y = gy[y, x]
+        magnitude = math.sqrt(val_x**2 + val_y**2)
+        if magnitude == 0:
+            continue
+        angle = math.degrees(math.atan2(val_y, val_x))
+        if angle < 0:
+            angle += 360
+        hist[int(angle // 45) % 8] += magnitude
+    total = np.sum(hist)
+    if total > 0:
+        hist /= total
+    return hist
+
+def get_center_of_mass(blob):
+    pixels = np.array(blob["pixels"])
+    cx, cy = pixels.mean(axis=0)
+    return cx, cy
+
+def get_image_from_camera(camera):
+    buffer = camera.getImage()
+    img = np.frombuffer(buffer, np.uint8).reshape(
+        (camera.getHeight(), camera.getWidth(), 4))
+    return img[:, :, [2, 1, 0]]
+
+# ─────────────────────────────────────────────
+#  OPTICAL FLOW
+# ─────────────────────────────────────────────
+
+def compute_optical_flow_mask(prev_gray, curr_gray):
+    pb = gaussianBlur(prev_gray)
+    cb = gaussianBlur(curr_gray)
+
+    sx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=np.float32)
+    sy = np.array([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=np.float32)
+    h, w = cb.shape
+    padded = np.pad(cb, 1, mode='edge')
+    Ix = np.zeros((h, w), dtype=np.float32)
+    Iy = np.zeros((h, w), dtype=np.float32)
+    for i in range(3):
+        for j in range(3):
+            Ix += sx[i, j] * padded[i:i+h, j:j+w]
+            Iy += sy[i, j] * padded[i:i+h, j:j+w]
+
+    It = (cb - pb).astype(np.float32)
+    candidates = [(0,0),(-1,0),(1,0),(0,-1),(0,1),
+                  (-1,-1),(1,-1),(-1,1),(1,1)]
+
+    best_err = np.full((h, w), np.inf, dtype=np.float32)
+    flow_u   = np.zeros((h, w), dtype=np.float32)
+    flow_v   = np.zeros((h, w), dtype=np.float32)
+
+    for u, v in candidates:
+        err = (It + Ix * u + Iy * v) ** 2
+        better = err < best_err
+        best_err[better] = err[better]
+        flow_u[better] = u
+        flow_v[better] = v
+
+    mag = np.sqrt(flow_u**2 + flow_v**2)
+    threshold = mag.mean() + 2.0 * mag.std()
+    return mag > threshold
+
+def robot_is_moving(prev_scan, curr_scan):
+    valid = (prev_scan > 0.05) & (curr_scan > 0.05) & \
+            np.isfinite(prev_scan) & np.isfinite(curr_scan)
+    if valid.sum() < 10:
+        return False
+    return float(np.median(np.abs(curr_scan[valid] - prev_scan[valid]))) > 0.01
+
+# ─────────────────────────────────────────────
+#  PERCEPTION FRAME
+# ─────────────────────────────────────────────
+
+def get_frame(raw_rgb):
+    current_frame = downScale(50, 60, raw_rgb)
+    gray  = grayscale(current_frame)
+    blur  = gaussianBlur(gray)
+    gx, gy = get_gradients(blur)
+
+    magnitude = np.sqrt(gx**2 + gy**2)
+    edges = (magnitude >= 30).astype(np.uint8) * 255
+    blobs = blobDetect(edges)
+
+    for b in blobs:
+        b['hist'] = get_histogram(current_frame, b)
+        b['hog']  = get_gradient_histogram(gx, gy, b)
+
+    return {
+        'blur': blur, 'blobs': blobs,
+        'gx': gx, 'gy': gy,
+        'frame': current_frame, 'gray': gray
+    }
+
+def classify_blobs(blobs, moving_mask):
+    for blob in blobs:
+        pixels = blob["pixels"]
+        if len(pixels) == 0:
+            blob["dynamic"] = False
+            continue
+        moving_count = sum(
+            1 for (x, y) in pixels
+            if 0 <= y < moving_mask.shape[0] and 0 <= x < moving_mask.shape[1]
+            and moving_mask[y, x]
+        )
+        blob["dynamic"] = (moving_count / len(pixels)) > 0.1
+    return blobs
+
+# ─────────────────────────────────────────────
+#  VISUALISATION — camera/blob display only
+# ─────────────────────────────────────────────
+
+def visualize_camera(display, blobs, width, height, frame):
+    """
+    Display 0: blob view.
+      - Dynamic blobs  → solid red
+      - Static blobs   → true average colour
+    """
+    display.setColor(0x000000)
+    display.fillRectangle(0, 0, width, height)
+
+    for blob in blobs:
+        pixels     = blob["pixels"]
+        is_dynamic = blob.get("dynamic", False)
+
+        if is_dynamic:
+            display.setColor(0xFF2200)
+            for (x, y) in pixels:
+                if 0 <= x < width and 0 <= y < height:
+                    display.drawPixel(x, y)
+        else:
+            colors = np.array([frame[y, x] for (x, y) in pixels])
+            avg_r, avg_g, avg_b = np.mean(colors, axis=0).astype(int)
+            display.setColor(int((avg_r << 16) | (avg_g << 8) | avg_b))
+            for (x, y) in pixels:
+                if 0 <= x < width and 0 <= y < height:
+                    display.drawPixel(x, y)
+
+# ─────────────────────────────────────────────
+#  SETUP & MAIN LOOP
+# ─────────────────────────────────────────────
+
+def setup_robot():
+    robot    = Robot()
+    timestep = int(robot.getBasicTimeStep())
+
+    left_motor  = robot.getDevice('left wheel motor')
+    right_motor = robot.getDevice('right wheel motor')
+    left_motor.setPosition(float('inf'))
+    right_motor.setPosition(float('inf'))
+    left_motor.setVelocity(0)
+    right_motor.setVelocity(0)
+
+    camera = robot.getDevice('camera')
+    camera.enable(timestep)
+
+    ps0 = robot.getDevice('ps0')
+    ps0.enable(timestep)
+    ps7 = robot.getDevice('ps7')
+    ps7.enable(timestep)
+
+    lidar = robot.getDevice('lidar')
+    lidar.enable(timestep)
+    lidar.enablePointCloud()
+
+    display = robot.getDevice('display')
+
+    return robot, timestep, left_motor, right_motor, camera, ps0, ps7, lidar, display
+
+def run_robot():
+    robot, timestep, left_motor, right_motor, camera, ps0, ps7, lidar, display = setup_robot()
+
+    camera_w = camera.getWidth()
+    disp_w   = display.getWidth()
+    disp_h   = display.getHeight()
+    lidar_fov = lidar.getFov()
+
+    ds_h, ds_w = 50, 60
+    scale_x = camera_w / ds_w
+
+    prev_frame_data = None
+    prev_scan       = None
+    moving_mask     = np.zeros((ds_h, ds_w), dtype=bool)
+
+    print("SET UP READY :)")
+
+    while robot.step(timestep) != -1:
+        raw_rgb        = get_image_from_camera(camera)
+        curr_frame_data = get_frame(raw_rgb)
+        curr_scan      = np.array(lidar.getRangeImage(), dtype=np.float32)
+
+        # Optical flow mask
+        if prev_frame_data is not None:
+            moving_mask = compute_optical_flow_mask(
+                prev_frame_data['gray'], curr_frame_data['gray']
+            )
+            if prev_scan is not None and robot_is_moving(prev_scan, curr_scan):
+                moving_mask = np.zeros_like(moving_mask)
+        else:
+            moving_mask = np.zeros((ds_h, ds_w), dtype=bool)
+
+        # Classify blobs
+        classify_blobs(curr_frame_data['blobs'], moving_mask)
+
+        # Display: camera / blob view
+        visualize_camera(
+            display,
+            curr_frame_data['blobs'],
+            disp_w, disp_h,
+            curr_frame_data['frame']
+        )
+
+        # Console log
+        dynamic_blobs = [b for b in curr_frame_data['blobs'] if b.get('dynamic')]
+        if dynamic_blobs:
+            print(f"Dynamic blobs: {len(dynamic_blobs)}")
+            for b in dynamic_blobs:
+                cx, cy = get_center_of_mass(b)
+                print(f"  Moving object at ({cx:.1f}, {cy:.1f})")
+
+        prev_frame_data = curr_frame_data
+        prev_scan       = curr_scan
+
+run_robot()
