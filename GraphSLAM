@@ -1,0 +1,251 @@
+from controller import Robot, Keyboard
+import numpy as np
+import math
+
+class SLAM:
+    def __init__(self):
+        self.robot = Robot()
+        self.TIME_STEP = int(self.robot.getBasicTimeStep())
+
+        # Motors
+        self.left_motor = self.robot.getDevice('left wheel motor')
+        self.right_motor = self.robot.getDevice('right wheel motor')
+        self.left_motor.setPosition(float('inf'))
+        self.right_motor.setPosition(float('inf'))
+        self.left_motor.setVelocity(0.0)
+        self.right_motor.setVelocity(0.0)
+
+        # Encoders
+        self.left_encoder = self.robot.getDevice('left wheel sensor')
+        self.right_encoder = self.robot.getDevice('right wheel sensor')
+        self.left_encoder.enable(self.TIME_STEP)
+        self.right_encoder.enable(self.TIME_STEP)
+
+        # LiDAR
+        self.lidar = self.robot.getDevice("lidar")
+        self.lidar.enable(self.TIME_STEP)
+        self.lidar.enablePointCloud()
+        self.fov = self.lidar.getFov()
+        self.resolution = self.lidar.getHorizontalResolution()
+
+        # Keyboard
+        self.keyboard = self.robot.getKeyboard()
+        self.keyboard.enable(self.TIME_STEP)
+
+        # Display
+        self.display = self.robot.getDevice("display")
+        self.DW, self.DH = self.display.getWidth(), self.display.getHeight()
+        self.cell_size = 0.01   # 1 cm per pixel
+        self.OFFSET_X = self.DW // 2
+        self.OFFSET_Y = self.DH // 2
+
+        # Camera
+        self.scale = 100
+        self.cam_x = 0.0
+        self.cam_y = 0.0
+
+        # Robot params
+        self.R = 0.02
+        self.L = 0.0569
+        self.min_R, self.max_R = 0.05, 0.5
+
+        # State
+        self.x, self.y, self.theta = 0.0, 0.0, 0.0
+        self.prev_l, self.prev_r = 0.0, 0.0
+
+        # Pose graph
+        self.nodes = []
+        self.edges = []
+
+        self.dist_threshold = 0.1
+        self.angle_threshold = 0.3
+        self.last_node_pose = None
+
+    def keyboard_input(self):
+        key = self.keyboard.getKey()
+
+        ls, rs = 0.0, 0.0
+        if key == self.keyboard.UP:
+            ls, rs = 6.0, 6.0
+        elif key == self.keyboard.DOWN:
+            ls, rs = -6.0, -6.0
+        elif key == self.keyboard.LEFT:
+            ls, rs = -1.5, 1.5
+        elif key == self.keyboard.RIGHT:
+            ls, rs = 1.5, -1.5
+
+        self.left_motor.setVelocity(ls)
+        self.right_motor.setVelocity(rs)
+
+    def scan_to_points(self):
+        scan = np.array(self.lidar.getRangeImage())
+        angles = np.linspace(self.fov/2, -self.fov/2, len(scan))
+
+        mask = (scan > self.min_R) & (scan < self.max_R)
+        scan = scan[mask]
+        angles = angles[mask]
+
+        px = scan * np.cos(angles)
+        py = scan * np.sin(angles)
+
+        return np.stack((px, py), axis=1)
+
+    def update_position(self):
+        curr_l = self.left_encoder.getValue()
+        curr_r = self.right_encoder.getValue()
+
+        dl = self.R * (curr_l - self.prev_l)
+        dr = self.R * (curr_r - self.prev_r)
+
+        dc = (dr + dl) / 2.0
+        dt = (dr - dl) / self.L
+
+        self.x += dc * math.cos(self.theta + dt / 2.0)
+        self.y += dc * math.sin(self.theta + dt / 2.0)
+        self.theta += dt
+
+        self.theta = math.atan2(math.sin(self.theta), math.cos(self.theta))
+
+        self.prev_l = curr_l
+        self.prev_r = curr_r
+
+    def build_node(self, x, y, theta, id):
+        points = self.scan_to_points()
+
+        node = {
+            "id": id,
+            "x": x,
+            "y": y,
+            "theta": theta,
+            "points": points
+        }
+        self.nodes.append(node)
+
+    def build_edge(self, id_1, id_2):
+        n1 = self.nodes[id_1]
+        n2 = self.nodes[id_2]
+
+        dx = n2["x"] - n1["x"]
+        dy = n2["y"] - n1["y"]
+
+        dtheta = n2["theta"] - n1["theta"]
+        dtheta = math.atan2(math.sin(dtheta), math.cos(dtheta))
+
+        edge = {
+            "id_1": id_1,
+            "id_2": id_2,
+            "dx": dx,
+            "dy": dy,
+            "dtheta": dtheta
+        }
+        self.edges.append(edge)
+
+    def pose_graph(self):
+        if len(self.nodes) == 0:
+            self.build_node(self.x, self.y, self.theta, 0)
+            self.last_node_pose = (self.x, self.y, self.theta)
+            return
+
+        last_x, last_y, last_theta = self.last_node_pose
+
+        dx = self.x - last_x
+        dy = self.y - last_y
+        dist = math.sqrt(dx*dx + dy*dy)
+
+        dtheta = self.theta - last_theta
+        dtheta = math.atan2(math.sin(dtheta), math.cos(dtheta))
+
+        if dist > self.dist_threshold or abs(dtheta) > self.angle_threshold:
+            new_id = len(self.nodes)
+
+            self.build_node(self.x, self.y, self.theta, new_id)
+            self.build_edge(new_id - 1, new_id)
+
+            self.last_node_pose = (self.x, self.y, self.theta)
+
+    def transform_points(self, points, x, y, theta):
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        transformed = []
+
+        for px, py in points:
+            wx = px * cos_t - py * sin_t + x
+            wy = px * sin_t + py * cos_t + y
+            transformed.append((wx, wy))
+
+        return transformed
+
+    def update_map(self):
+        self.display.setColor(0x000000)
+        self.display.fillRectangle(0, 0, self.DW, self.DH)
+
+        self.cam_x, self.cam_y = self.x, self.y
+
+        # Draw walls
+        self.display.setColor(0xFFFFFF)
+        for node in self.nodes:
+            world_pts = self.transform_points(
+                node["points"],
+                node["x"],
+                node["y"],
+                node["theta"]
+            )
+
+            for px, py in world_pts:
+                sx = int((px - self.cam_x) * self.scale + self.DW / 2)
+                sy = int((py - self.cam_y) * self.scale + self.DH / 2)
+                sy = self.DH - sy
+
+                if 0 <= sx < self.DW and 0 <= sy < self.DH:
+                    self.display.drawPixel(sx, sy)
+
+        # Draw edges
+        self.display.setColor(0x00FF00)
+        for edge in self.edges:
+            n1 = self.nodes[edge["id_1"]]
+            n2 = self.nodes[edge["id_2"]]
+
+            sx1 = int((n1["x"] - self.cam_x) * self.scale + self.DW / 2)
+            sy1 = int((n1["y"] - self.cam_y) * self.scale + self.DH / 2)
+
+            sx2 = int((n2["x"] - self.cam_x) * self.scale + self.DW / 2)
+            sy2 = int((n2["y"] - self.cam_y) * self.scale + self.DH / 2)
+
+            sy1 = self.DH - sy1
+            sy2 = self.DH - sy2
+
+            self.display.drawLine(sx1, sy1, sx2, sy2)
+
+        # Draw nodes
+        self.display.setColor(0x0000FF)  # blue
+        for node in self.nodes:
+            sx = int((node["x"] - self.cam_x) * self.scale + self.DW / 2)
+            sy = int((node["y"] - self.cam_y) * self.scale + self.DH / 2)
+            sy = self.DH - sy
+
+            if 0 <= sx < self.DW and 0 <= sy < self.DH:
+                self.display.drawPixel(sx, sy)
+
+        # Draw robot
+        sx_r = int((self.x - self.cam_x) * self.scale + self.DW / 2)
+        sy_r = int((self.y - self.cam_y) * self.scale + self.DH / 2)
+        sy_r = self.DH - sy_r
+
+        if 0 <= sx_r < self.DW and 0 <= sy_r < self.DH:
+            self.display.setColor(0xFF0000)
+            self.display.drawPixel(sx_r, sy_r)
+
+    def run(self):
+        self.robot.step(self.TIME_STEP)
+        self.prev_l = self.left_encoder.getValue()
+        self.prev_r = self.right_encoder.getValue()
+
+        while self.robot.step(self.TIME_STEP) != -1:
+            self.keyboard_input()
+            self.update_position()
+            self.pose_graph()
+            self.update_map()
+
+if __name__ == "__main__":
+    slam = SLAM()
+    slam.run()
